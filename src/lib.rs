@@ -19,6 +19,7 @@ pub mod export;
 pub mod ftui_harness;
 pub mod html_export;
 pub mod indexer;
+pub mod live_grep;
 pub mod model;
 pub mod pages;
 pub mod perf_evidence;
@@ -357,6 +358,57 @@ pub enum Commands {
         /// Topic to print
         #[arg(value_enum)]
         topic: RobotTopic,
+    },
+    /// Bounded direct grep over live agent session files; bypasses index/semantic assets
+    #[command(visible_alias = "live-search")]
+    Grep {
+        /// Literal query string by default. Use --regex for a regular expression.
+        query: String,
+        /// Additional or replacement root to scan. When present, defaults are not scanned.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        root: Vec<PathBuf>,
+        /// Filter by inferred agent slug (codex, claude, pi_agent, gemini, cursor)
+        #[arg(long)]
+        agent: Vec<String>,
+        /// Max hits to return. 0 uses the bounded default.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Max candidate files to inspect, newest first.
+        #[arg(long, default_value_t = 2_000)]
+        max_files: usize,
+        /// Skip individual files larger than this many bytes.
+        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        max_file_bytes: u64,
+        /// Stop scanning after this many milliseconds.
+        #[arg(long, default_value_t = 3_000)]
+        timeout: u64,
+        /// Scan all candidate files instead of the default recent window.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        /// Filter to last N days. Overrides the default 14-day window.
+        #[arg(long)]
+        days: Option<u32>,
+        /// Filter to today only.
+        #[arg(long)]
+        today: bool,
+        /// Filter to yesterday only.
+        #[arg(long)]
+        yesterday: bool,
+        /// Filter to last 7 days.
+        #[arg(long)]
+        week: bool,
+        /// Treat query as a regex instead of a smart literal.
+        #[arg(long, default_value_t = false)]
+        regex: bool,
+        /// Make literal/regex matching case-sensitive.
+        #[arg(long, default_value_t = false)]
+        case_sensitive: bool,
+        /// Output as JSON (--robot also works).
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Human-readable display format: lines or markdown.
+        #[arg(long, value_enum)]
+        display: Option<DisplayFormat>,
     },
     /// Run a one-off search and print results to stdout
     Search {
@@ -2279,6 +2331,7 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "doctor"
             | "expand"
             | "export-html"
+            | "grep"
             | "health"
             | "import"
             | "index"
@@ -2537,6 +2590,68 @@ mod robot_docs_shorthand_regression_tests {
             note.as_deref()
                 .is_none_or(|note| !note.contains("structured help request")),
             "a search query named `help` must not be treated as a help request"
+        );
+    }
+
+    #[test]
+    fn grep_is_a_real_command_not_search_alias() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let parsed = parse_cli(vec![
+                    "cass".to_string(),
+                    "grep".to_string(),
+                    "remote-preservation score".to_string(),
+                    "--agent".to_string(),
+                    "codex".to_string(),
+                    "--today".to_string(),
+                    "--json".to_string(),
+                ])
+                .expect("parse grep command");
+
+                let Some(Commands::Grep {
+                    query,
+                    agent,
+                    today,
+                    json,
+                    ..
+                }) = parsed.cli.command
+                else {
+                    panic!("grep must parse as Commands::Grep");
+                };
+
+                assert_eq!(query, "remote-preservation score");
+                assert_eq!(agent, vec!["codex".to_string()]);
+                assert!(today);
+                assert!(json);
+            })
+            .expect("spawn parser test thread")
+            .join()
+            .expect("parser test thread");
+    }
+
+    #[test]
+    fn leading_json_moves_to_grep_subcommand() {
+        let raw = vec![
+            "cass".to_string(),
+            "--json".to_string(),
+            "grep".to_string(),
+            "remote-preservation score".to_string(),
+        ];
+        let (normalized, note) = normalize_args(raw);
+        assert_eq!(
+            normalized,
+            vec![
+                "cass".to_string(),
+                "grep".to_string(),
+                "remote-preservation score".to_string(),
+                "--json".to_string()
+            ]
+        );
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("Leading --json/--robot moved")),
+            "leading --json should move to grep without rewriting grep to search"
         );
     }
 
@@ -2882,6 +2997,46 @@ struct AssignmentOption {
 
 fn assignment_option_for_command(command: &str, key: &str) -> Option<AssignmentOption> {
     match command {
+        "grep" => match key {
+            "agent" | "provider" | "tool" | "connector" | "agent-type" | "agent_type" => {
+                Some(AssignmentOption {
+                    flag: "--agent",
+                    aliases: &["--agent"],
+                    repeatable: true,
+                })
+            }
+            "root" => Some(AssignmentOption {
+                flag: "--root",
+                aliases: &["--root"],
+                repeatable: true,
+            }),
+            "max-files" | "max_files" => Some(AssignmentOption {
+                flag: "--max-files",
+                aliases: &["--max-files"],
+                repeatable: false,
+            }),
+            "max-file-bytes" | "max_file_bytes" => Some(AssignmentOption {
+                flag: "--max-file-bytes",
+                aliases: &["--max-file-bytes"],
+                repeatable: false,
+            }),
+            "timeout" => Some(AssignmentOption {
+                flag: "--timeout",
+                aliases: &["--timeout"],
+                repeatable: false,
+            }),
+            "days" => Some(AssignmentOption {
+                flag: "--days",
+                aliases: &["--days"],
+                repeatable: false,
+            }),
+            "display" => Some(AssignmentOption {
+                flag: "--display",
+                aliases: &["--display"],
+                repeatable: false,
+            }),
+            _ => None,
+        },
         "search" => match key {
             "agent" | "provider" | "tool" | "connector" | "agent-type" | "agent_type" => {
                 Some(AssignmentOption {
@@ -3249,7 +3404,7 @@ fn recover_time_alias_flags(rest: &mut Vec<String>, corrections: &mut Vec<String
 }
 
 fn command_accepts_agent_filter_alias(command: &str) -> bool {
-    matches!(command, "search" | "pack" | "timeline")
+    matches!(command, "grep" | "search" | "pack" | "timeline")
 }
 
 fn take_agent_filter_alias_flag(rest: &mut Vec<String>) -> Option<(String, String)> {
@@ -3357,7 +3512,7 @@ fn bare_option_pair_start_index(command: &str) -> Option<usize> {
         // Require at least one query token before interpreting bare words as
         // filters. Otherwise `cass search provider codex --json` would lose a
         // plausible query instead of producing a useful usage error.
-        "search" | "pack" => Some(2),
+        "grep" | "search" | "pack" => Some(2),
         "sessions" | "timeline" => Some(1),
         _ => None,
     }
@@ -3608,7 +3763,7 @@ fn recover_named_required_positionals(rest: &mut Vec<String>, corrections: &mut 
     };
 
     match command.as_str() {
-        "search" | "pack" => {
+        "grep" | "search" | "pack" => {
             if let Some((flag, value)) =
                 take_named_value(rest, &["--query", "--q", "--text", "--pattern"])
             {
@@ -3792,7 +3947,7 @@ fn recover_structured_format_aliases(rest: &mut Vec<String>, corrections: &mut V
 fn command_accepts_limit_alias(rest: &[String]) -> bool {
     match rest.first().map(String::as_str) {
         Some("analytics") => rest.get(1).is_some_and(|arg| arg == "tools"),
-        Some("context" | "pack" | "search" | "sessions") => true,
+        Some("context" | "grep" | "pack" | "search" | "sessions") => true,
         _ => false,
     }
 }
@@ -4013,7 +4168,7 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
     let Some(command) = rest.first().cloned() else {
         return;
     };
-    if !matches!(command.as_str(), "search" | "pack") {
+    if !matches!(command.as_str(), "grep" | "search" | "pack") {
         return;
     }
     if rest.get(1).is_none_or(|arg| arg.starts_with('-')) {
@@ -4084,6 +4239,9 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "robot",
         "json",
         "limit",
+        "max-files",
+        "max_file_bytes",
+        "max-file-bytes",
         "max-results",
         "num-results",
         "results",
@@ -4124,6 +4282,11 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "today",
         "yesterday",
         "week",
+        "all",
+        "root",
+        "regex",
+        "case-sensitive",
+        "case_sensitive",
         "full",
         "watch",
         "data-dir",
@@ -4244,7 +4407,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         ("query", "search"),
         ("q", "search"),
         ("lookup", "search"),
-        ("grep", "search"),
         ("session", "sessions"),
         // Stats aliases
         ("ls", "stats"),
@@ -5093,6 +5255,7 @@ fn get_common_mistakes(intent: &str) -> Option<serde_json::Value> {
 }
 
 const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
+    "grep",
     "search",
     "pack",
     "stats",
@@ -5758,6 +5921,7 @@ async fn execute_cli(
             }
         }
         Commands::Index { .. }
+        | Commands::Grep { .. }
         | Commands::Search { .. }
         | Commands::Pack { .. }
         | Commands::Stats { .. }
@@ -5815,6 +5979,44 @@ async fn execute_cli(
                         progress_interval_ms,
                         no_progress_events,
                         robot_trace_ingest,
+                    )?;
+                }
+                Commands::Grep {
+                    query,
+                    root,
+                    agent,
+                    limit,
+                    max_files,
+                    max_file_bytes,
+                    timeout,
+                    all,
+                    days,
+                    today,
+                    yesterday,
+                    week,
+                    regex,
+                    case_sensitive,
+                    json,
+                    display,
+                } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_live_grep_command(
+                        &query,
+                        &root,
+                        &agent,
+                        limit,
+                        max_files,
+                        max_file_bytes,
+                        timeout,
+                        all,
+                        days,
+                        today,
+                        yesterday,
+                        week,
+                        regex,
+                        case_sensitive,
+                        structured_format,
+                        display,
                     )?;
                 }
                 Commands::Search {
@@ -12872,6 +13074,7 @@ fn describe_command(cli: &Cli) -> String {
     match &cli.command {
         Some(Commands::Tui { .. }) => "tui".to_string(),
         Some(Commands::Index { .. }) => "index".to_string(),
+        Some(Commands::Grep { .. }) => "grep".to_string(),
         Some(Commands::Search { .. }) => "search".to_string(),
         Some(Commands::Pack { .. }) => "pack".to_string(),
         Some(Commands::Stats { .. }) => "stats".to_string(),
@@ -12935,6 +13138,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
     let env_robot_mode = robot_format_from_env().is_some();
 
     match command {
+        Commands::Grep { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Search {
             json, robot_meta, ..
         } => resolve_subcommand_structured_format(cli, *json).is_some() || *robot_meta,
@@ -15110,6 +15314,173 @@ mod search_lexical_self_heal_tests {
         assert!(checkpoint.completed);
         assert_eq!(checkpoint.indexed_docs, 0);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_live_grep_command(
+    query: &str,
+    roots: &[PathBuf],
+    agents: &[String],
+    limit: usize,
+    max_files: usize,
+    max_file_bytes: u64,
+    timeout_ms: u64,
+    all: bool,
+    days: Option<u32>,
+    today: bool,
+    yesterday: bool,
+    week: bool,
+    regex: bool,
+    case_sensitive: bool,
+    output_format: Option<RobotFormat>,
+    display_format: Option<DisplayFormat>,
+) -> CliResult<()> {
+    let mut opts = live_grep::LiveGrepOptions::bounded(query.to_string());
+    if !roots.is_empty() {
+        opts.roots = roots.to_vec();
+    }
+    opts.agents = agents
+        .iter()
+        .map(|agent| agent.to_ascii_lowercase())
+        .collect();
+    opts.limit = limit;
+    opts.max_files = max_files;
+    opts.max_file_bytes = max_file_bytes;
+    opts.timeout = Duration::from_millis(timeout_ms.max(1));
+    opts.regex = regex;
+    opts.ignore_case = !case_sensitive;
+    let (since, until, time_filter_label) =
+        live_grep_time_bounds(all, days, today, yesterday, week);
+    opts.since = since;
+    opts.until = until;
+    opts.time_filter_label = Some(time_filter_label);
+
+    let result = live_grep::live_grep(&opts).map_err(|err| CliError {
+        code: 9,
+        kind: CliErrorKind::Search.kind_str(),
+        message: format!("live grep failed: {err}"),
+        hint: Some(
+            "Reduce --max-files, narrow --root/--agent, or retry with --all only when needed."
+                .to_string(),
+        ),
+        retryable: false,
+    })?;
+
+    if matches!(output_format, Some(RobotFormat::Sessions)) {
+        let mut paths = BTreeSet::new();
+        for hit in &result.hits {
+            if paths.insert(hit.source_path.as_str()) {
+                println!("{}", hit.source_path);
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(format) = output_format {
+        let payload = serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({}));
+        return output_structured_value(payload, format);
+    }
+
+    match display_format.unwrap_or(DisplayFormat::Lines) {
+        DisplayFormat::Markdown => {
+            println!("# cass grep results");
+            println!();
+            println!("- query: `{}`", query);
+            println!("- hits: {}", result.hits.len());
+            println!("- scanned_files: {}", result._meta.scanned_files);
+            println!("- elapsed_ms: {}", result._meta.elapsed_ms);
+            println!("- timed_out: {}", result._meta.timed_out);
+            println!();
+            for hit in &result.hits {
+                println!(
+                    "- `{}`:{} [{}] {}",
+                    hit.source_path, hit.line_number, hit.agent, hit.snippet
+                );
+            }
+        }
+        DisplayFormat::Table | DisplayFormat::Lines => {
+            println!(
+                "hits={} scanned_files={} elapsed_ms={} timed_out={}",
+                result.hits.len(),
+                result._meta.scanned_files,
+                result._meta.elapsed_ms,
+                result._meta.timed_out
+            );
+            for hit in &result.hits {
+                println!(
+                    "{}:{} [{}] {}",
+                    hit.source_path, hit.line_number, hit.agent, hit.snippet
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn live_grep_time_bounds(
+    all: bool,
+    days: Option<u32>,
+    today: bool,
+    yesterday: bool,
+    week: bool,
+) -> (
+    Option<std::time::SystemTime>,
+    Option<std::time::SystemTime>,
+    String,
+) {
+    use chrono::{Datelike, TimeZone};
+
+    if all {
+        return (None, None, "all".to_string());
+    }
+    let now = chrono::Local::now();
+    let today_start = chrono::Local
+        .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
+        .single()
+        .unwrap_or(now);
+    if today {
+        return (
+            system_time_from_millis(today_start.timestamp_millis()),
+            None,
+            "today".to_string(),
+        );
+    }
+    if yesterday {
+        let yesterday_start = today_start - chrono::Duration::days(1);
+        return (
+            system_time_from_millis(yesterday_start.timestamp_millis()),
+            system_time_from_millis(today_start.timestamp_millis()),
+            "yesterday".to_string(),
+        );
+    }
+    if week {
+        return (
+            system_time_from_millis((now - chrono::Duration::days(7)).timestamp_millis()),
+            None,
+            "last 7 days".to_string(),
+        );
+    }
+    if let Some(days) = days {
+        return (
+            system_time_from_millis(
+                (now - chrono::Duration::days(i64::from(days))).timestamp_millis(),
+            ),
+            None,
+            format!("last {days} days"),
+        );
+    }
+    (
+        std::time::SystemTime::now().checked_sub(Duration::from_secs(14 * 24 * 60 * 60)),
+        None,
+        "last 14 days".to_string(),
+    )
+}
+
+fn system_time_from_millis(millis: i64) -> Option<std::time::SystemTime> {
+    if millis < 0 {
+        return None;
+    }
+    Some(std::time::UNIX_EPOCH + Duration::from_millis(millis as u64))
 }
 
 #[allow(clippy::too_many_arguments)]

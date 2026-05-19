@@ -220,9 +220,9 @@ mod tests {
 
     #[test]
     fn test_resource_monitor_creation() {
-        let monitor = ResourceMonitor::new();
+        let _monitor = ResourceMonitor::new();
         #[cfg(target_os = "linux")]
-        assert!(monitor.pid > 0);
+        assert!(_monitor.pid > 0);
     }
 
     #[test]

@@ -13152,6 +13152,7 @@ static LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct LexicalPublishInjectedRenameFailureGuard {
     previous: Option<LexicalPublishInjectedRenameFailure>,
 }
@@ -13168,6 +13169,7 @@ impl Drop for LexicalPublishInjectedRenameFailureGuard {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn inject_lexical_publish_rename_failure_once(
     site: LexicalPublishRenameSite,
     raw_os_error: i32,

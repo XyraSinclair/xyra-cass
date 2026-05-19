@@ -1,0 +1,433 @@
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use regex::RegexBuilder;
+use serde::Serialize;
+use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+use walkdir::{DirEntry, WalkDir};
+
+const DEFAULT_LIMIT: usize = 20;
+const DEFAULT_MAX_FILES: usize = 2_000;
+const DEFAULT_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(3_000);
+const DEFAULT_RECENT_WINDOW: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const MAX_SNIPPET_CHARS: usize = 500;
+
+#[derive(Debug, Clone)]
+pub struct LiveGrepOptions {
+    pub query: String,
+    pub roots: Vec<PathBuf>,
+    pub agents: Vec<String>,
+    pub limit: usize,
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+    pub timeout: Duration,
+    pub since: Option<SystemTime>,
+    pub until: Option<SystemTime>,
+    pub time_filter_label: Option<String>,
+    pub ignore_case: bool,
+    pub regex: bool,
+}
+
+impl LiveGrepOptions {
+    pub fn bounded(query: String) -> Self {
+        Self {
+            query,
+            roots: default_session_roots(),
+            agents: Vec::new(),
+            limit: DEFAULT_LIMIT,
+            max_files: DEFAULT_MAX_FILES,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            timeout: DEFAULT_TIMEOUT,
+            since: SystemTime::now().checked_sub(DEFAULT_RECENT_WINDOW),
+            until: None,
+            time_filter_label: Some("last 14 days".to_string()),
+            ignore_case: true,
+            regex: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveGrepHit {
+    pub source_path: String,
+    pub line_number: usize,
+    pub agent: String,
+    pub modified: Option<String>,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveGrepMeta {
+    pub scanned_files: usize,
+    pub skipped_files: usize,
+    pub matched_files: usize,
+    pub elapsed_ms: u128,
+    pub timed_out: bool,
+    pub limit: usize,
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+    pub time_filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveGrepResult {
+    pub query: String,
+    pub hits: Vec<LiveGrepHit>,
+    pub roots: Vec<String>,
+    pub _meta: LiveGrepMeta,
+}
+
+pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
+    if opts.query.trim().is_empty() {
+        anyhow::bail!("live grep query must not be empty");
+    }
+
+    let started = Instant::now();
+    let deadline = started + opts.timeout;
+    let mut candidates = collect_candidate_files(opts, deadline)?;
+    candidates.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    let matcher = Matcher::new(&opts.query, opts.ignore_case, opts.regex)?;
+    let limit = if opts.limit == 0 {
+        DEFAULT_LIMIT
+    } else {
+        opts.limit
+    };
+    let mut scanned_files = 0usize;
+    let mut skipped_files = 0usize;
+    let mut matched_paths = BTreeSet::new();
+    let mut hits = Vec::new();
+    let mut timed_out = false;
+
+    for candidate in candidates.into_iter().take(opts.max_files) {
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+        if candidate.size_bytes > opts.max_file_bytes {
+            skipped_files = skipped_files.saturating_add(1);
+            continue;
+        }
+        scanned_files = scanned_files.saturating_add(1);
+        let file = match File::open(&candidate.path) {
+            Ok(file) => file,
+            Err(_) => {
+                skipped_files = skipped_files.saturating_add(1);
+                continue;
+            }
+        };
+        let reader = BufReader::new(file);
+        for (index, line) in reader.lines().enumerate() {
+            if Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
+            let Ok(line) = line else {
+                continue;
+            };
+            if !matcher.matches(&line) {
+                continue;
+            }
+            matched_paths.insert(candidate.path.clone());
+            hits.push(LiveGrepHit {
+                source_path: candidate.path.to_string_lossy().into_owned(),
+                line_number: index.saturating_add(1),
+                agent: candidate.agent.clone(),
+                modified: candidate.modified.map(format_system_time),
+                snippet: trim_snippet(&line),
+            });
+            if hits.len() >= limit {
+                break;
+            }
+        }
+        if hits.len() >= limit || timed_out {
+            break;
+        }
+    }
+
+    Ok(LiveGrepResult {
+        query: opts.query.clone(),
+        hits,
+        roots: opts
+            .roots
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        _meta: LiveGrepMeta {
+            scanned_files,
+            skipped_files,
+            matched_files: matched_paths.len(),
+            elapsed_ms: started.elapsed().as_millis(),
+            timed_out,
+            limit,
+            max_files: opts.max_files,
+            max_file_bytes: opts.max_file_bytes,
+            time_filter: opts.time_filter_label.clone(),
+        },
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CandidateFile {
+    path: PathBuf,
+    agent: String,
+    modified: Option<SystemTime>,
+    size_bytes: u64,
+}
+
+fn collect_candidate_files(
+    opts: &LiveGrepOptions,
+    deadline: Instant,
+) -> Result<Vec<CandidateFile>> {
+    let mut files = Vec::new();
+    let wanted_agents = opts
+        .agents
+        .iter()
+        .map(|agent| agent.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+
+    for root in &opts.roots {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if !root.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !is_hidden_noise_dir(entry))
+            .filter_map(|entry| entry.ok())
+        {
+            if Instant::now() >= deadline || files.len() >= opts.max_files {
+                break;
+            }
+            if !entry.file_type().is_file() || !is_session_file(entry.path()) {
+                continue;
+            }
+            let agent = infer_agent(entry.path());
+            if !wanted_agents.is_empty() && !wanted_agents.contains(&agent) {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let modified = metadata.modified().ok();
+            if !time_in_range(modified, opts.since, opts.until) {
+                continue;
+            }
+            files.push(CandidateFile {
+                path: entry.path().to_path_buf(),
+                agent,
+                modified,
+                size_bytes: metadata.len(),
+            });
+        }
+    }
+
+    Ok(files)
+}
+
+fn is_hidden_noise_dir(entry: &DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return false;
+    }
+    let name = entry.file_name().to_string_lossy();
+    matches!(
+        name.as_ref(),
+        ".git" | "target" | "node_modules" | ".cache" | ".tmp" | "tmp"
+    )
+}
+
+fn is_session_file(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "jsonl" | "json" | "claude" | "md" | "txt"
+    )
+}
+
+fn default_session_roots() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    vec![
+        home.join(".codex/tabs"),
+        home.join(".codex/sessions"),
+        home.join(".claude/projects"),
+        home.join(".pi/agent/sessions"),
+        home.join(".gemini"),
+        home.join(".cursor"),
+        home.join("Library/Application Support/Cursor/User/workspaceStorage"),
+    ]
+}
+
+fn infer_agent(path: &Path) -> String {
+    let text = path.to_string_lossy().to_ascii_lowercase();
+    if text.contains("/.codex/") {
+        "codex".to_string()
+    } else if text.contains("/.claude/") {
+        "claude".to_string()
+    } else if text.contains("/.pi/") {
+        "pi_agent".to_string()
+    } else if text.contains("/.gemini/") {
+        "gemini".to_string()
+    } else if text.contains("/cursor/") || text.contains("/.cursor/") {
+        "cursor".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn time_in_range(
+    modified: Option<SystemTime>,
+    since: Option<SystemTime>,
+    until: Option<SystemTime>,
+) -> bool {
+    let Some(modified) = modified else {
+        return since.is_none() && until.is_none();
+    };
+    if let Some(since) = since
+        && modified < since
+    {
+        return false;
+    }
+    if let Some(until) = until
+        && modified >= until
+    {
+        return false;
+    }
+    true
+}
+
+enum Matcher {
+    Literal {
+        needle: String,
+        normalized_needle: String,
+        ignore_case: bool,
+    },
+    Regex(regex::Regex),
+}
+
+impl Matcher {
+    fn new(query: &str, ignore_case: bool, regex: bool) -> Result<Self> {
+        if regex {
+            return RegexBuilder::new(query)
+                .case_insensitive(ignore_case)
+                .build()
+                .map(Self::Regex)
+                .with_context(|| "invalid live grep regex");
+        }
+        let needle = if ignore_case {
+            query.to_ascii_lowercase()
+        } else {
+            query.to_string()
+        };
+        let normalized_needle = normalize_match_text(&needle);
+        Ok(Self::Literal {
+            needle,
+            normalized_needle,
+            ignore_case,
+        })
+    }
+
+    fn matches(&self, haystack: &str) -> bool {
+        match self {
+            Self::Regex(regex) => regex.is_match(haystack),
+            Self::Literal {
+                needle,
+                normalized_needle,
+                ignore_case,
+            } => {
+                let candidate = if *ignore_case {
+                    haystack.to_ascii_lowercase()
+                } else {
+                    haystack.to_string()
+                };
+                candidate.contains(needle)
+                    || normalize_match_text(&candidate).contains(normalized_needle)
+            }
+        }
+    }
+}
+
+fn normalize_match_text(text: &str) -> String {
+    let text = text.replace("\\n", " ").replace("\\t", " ");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn trim_snippet(line: &str) -> String {
+    let clean = normalize_match_text(line);
+    if clean.chars().count() <= MAX_SNIPPET_CHARS {
+        return clean;
+    }
+    let mut snippet = clean.chars().take(MAX_SNIPPET_CHARS).collect::<String>();
+    snippet.push_str("...");
+    snippet
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    DateTime::<Utc>::from(time).to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn literal_match_normalizes_pasted_newlines() {
+        let matcher = Matcher::new(
+            "remote-preservation score was too generous because it had receipt only",
+            true,
+            false,
+        )
+        .expect("matcher");
+
+        assert!(matcher.matches(
+            "remote-preservation score was too generous because it had receipt\\n  only churn"
+        ));
+    }
+
+    #[test]
+    fn live_grep_scans_newest_session_files_with_bounds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session = tmp.path().join("rollout-1.jsonl");
+        let mut file = File::create(&session).expect("create session");
+        writeln!(file, "{{\"message\":\"needle in session\"}}").expect("write session");
+
+        let opts = LiveGrepOptions {
+            query: "needle".to_string(),
+            roots: vec![tmp.path().to_path_buf()],
+            agents: Vec::new(),
+            limit: 5,
+            max_files: 20,
+            max_file_bytes: 1024 * 1024,
+            timeout: Duration::from_secs(1),
+            since: None,
+            until: None,
+            time_filter_label: None,
+            ignore_case: true,
+            regex: false,
+        };
+
+        let result = live_grep(&opts).expect("live grep");
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].line_number, 1);
+        assert_eq!(result._meta.scanned_files, 1);
+        assert!(!result._meta.timed_out);
+    }
+}

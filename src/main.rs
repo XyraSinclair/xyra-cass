@@ -221,6 +221,7 @@ fn main() -> anyhow::Result<()> {
     let use_current_thread = matches!(
         parsed.cli.command,
         Some(coding_agent_search::Commands::Search { .. })
+            | Some(coding_agent_search::Commands::Grep { .. })
     );
     let runtime = if use_current_thread {
         asupersync::runtime::RuntimeBuilder::current_thread().build()?
