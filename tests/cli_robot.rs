@@ -5176,23 +5176,34 @@ fn normalize_flag_case() {
     cmd.assert().success().stdout(contains("cass --robot-help"));
 }
 
-/// Subcommand aliases should work: find → search
+/// `find` is a first-class direct source-log command, not a search alias.
 #[test]
-fn subcommand_alias_find_to_search() {
-    let mut cmd = base_cmd();
-    cmd.args([
-        "find",
-        "test query",
-        "--json",
-        "--data-dir",
-        "tests/fixtures/search_demo_data",
-    ]);
-    // 'find' should be normalized to 'search'
-    // May succeed or fail based on search results, but should not fail on parsing
-    let assert = cmd.assert();
-    // If command is recognized, it should either succeed or fail with a search-related error
-    // not a "command not found" error
-    assert.code(predicate::in_iter(vec![0, 1, 2, 3]));
+fn subcommand_find_is_direct_command() {
+    run_on_large_stack(|| {
+        let parsed = Cli::try_parse_from([
+            "cass",
+            "find",
+            "test query",
+            "--root",
+            "tests/fixtures/search_demo_data",
+            "--json",
+        ])
+        .expect("find should parse");
+
+        let Some(Commands::Find {
+            query, root, json, ..
+        }) = parsed.command
+        else {
+            panic!("find must parse as Commands::Find");
+        };
+
+        assert_eq!(query, "test query");
+        assert_eq!(
+            root,
+            vec![Path::new("tests/fixtures/search_demo_data").to_path_buf()]
+        );
+        assert!(json);
+    });
 }
 
 /// Subcommand alias: query → search
@@ -5524,32 +5535,30 @@ fn implicit_robot_pack_query_uses_pack_when_pack_only_flags_present() {
 
 #[test]
 fn explicit_search_pack_only_flags_run_pack_in_robot_mode() {
-    for command in ["search", "find"] {
-        let mut cmd = base_cmd();
-        cmd.args([
-            command,
-            "auth",
-            "failed",
-            "--json",
-            "--data-dir",
-            "tests/fixtures/search_demo_data",
-            "--limit",
-            "1",
-            "--max-evidence",
-            "1",
-            "--max-sessions",
-            "1",
-        ]);
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "auth",
+        "failed",
+        "--json",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+        "--limit",
+        "1",
+        "--max-evidence",
+        "1",
+        "--max-sessions",
+        "1",
+    ]);
 
-        let output = cmd.assert().success().get_output().clone();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let json: Value = serde_json::from_str(stdout.trim()).expect("valid pack JSON");
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid pack JSON");
 
-        assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v1"));
-        assert_eq!(json["query"]["text"].as_str(), Some("auth failed"));
-        assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
-        assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));
-    }
+    assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v1"));
+    assert_eq!(json["query"]["text"].as_str(), Some("auth failed"));
+    assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
+    assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));
 }
 
 #[test]

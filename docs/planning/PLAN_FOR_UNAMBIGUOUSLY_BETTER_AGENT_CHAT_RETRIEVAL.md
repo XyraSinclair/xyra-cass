@@ -686,12 +686,14 @@ This work is not done until all of these are true:
 
 ## Immediate next implementation moves
 
-1. Add `cass find` as the product-facing command backed by the current live grep engine.
-2. Add direct query-plan metadata and touched-subsystem assertions.
-3. Add `providers list --json` for direct search coverage.
-4. Add provider manifests for Codex and Claude.
-5. Add a bakeoff fixture for the exact sessions already tested in this work.
-6. Add watcher diagnostics for `com.xyra.cass-index-watch`-style stale binaries.
-7. Teach `cass search` to fall back to direct find on `index-busy` for exact/fresh queries.
+- [x] Add `cass find` as the product-facing command backed by the current live grep engine.
+  - Implemented 2026-05-20: `find` is a first-class direct CLI command; `grep` remains the low-level direct scanner.
+- [x] Add direct query-plan metadata and touched-subsystem assertions.
+  - Implemented 2026-05-20: direct JSON output now reports `_meta.intent`, `_meta.query_plan`, `_meta.touched_subsystems`, and `_meta.did_not_touch_subsystems`.
+- [ ] Add `providers list --json` for direct search coverage.
+- [ ] Add provider manifests for Codex and Claude.
+- [ ] Add a bakeoff fixture for the exact sessions already tested in this work.
+- [ ] Add watcher diagnostics for `com.xyra.cass-index-watch`-style stale binaries.
+- [ ] Teach `cass search` to fall back to direct find on `index-busy` for exact/fresh queries.
 
 These moves turn the current improvement from a useful patch into the start of the replacement product.

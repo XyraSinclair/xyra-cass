@@ -56,7 +56,7 @@ cass triage --json
 # 2) Find or resume a live/recent agent chat without touching the index.
 #    Use this first for exact phrases, current-session recovery, stale-index
 #    recovery, and "what was that prompt?" archaeology.
-cass grep "remote-preservation score" --agent codex --today --role user --json
+cass find "remote-preservation score" --agent codex --today --role user --json
 
 # 3) Search across the indexed archive. Default search is hybrid-preferred:
 #    lexical is the fast required path; semantic refinement joins when ready.
@@ -87,7 +87,7 @@ cass sources agents include openclaw
 - exit 0 = success
 
 **Search asset contract**
-- `cass grep` is the direct source-log path for exact or phrase-like agent-chat recovery. It bypasses SQLite, Tantivy, semantic vectors, rerankers, daemons, and index locks. Its freshness boundary is the provider's own session file, not the cass index.
+- `cass find` is the direct source-log path for exact or phrase-like agent-chat recovery. It bypasses SQLite, Tantivy, semantic vectors, rerankers, daemons, and index locks. Its freshness boundary is the provider's own session file, not the cass index. `cass grep` remains the low-level direct scanner.
 - SQLite is the source of truth for indexed conversations and messages. All derived assets (lexical index, semantic vectors, analytics rollups, retention backups) can be rebuilt from SQLite; no derived asset is authoritative.
 - Lexical search is the required fast path. Missing, stale, or incompatible lexical assets are treated as derived-state problems that cass should rebuild from SQLite instead of asking operators to perform routine manual repair.
 - Hybrid is the default search intent. Robot metadata (`--robot --robot-meta`) reports the requested mode, realized mode, semantic refinement status, and any lexical fallback reason when semantic assets are not ready.
@@ -767,7 +767,7 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass -robot --limit=5` | `cass --robot --limit=5` | Single-dash long flags normalized |
 | `cass --Robot --LIMIT 5` | `cass --robot --limit 5` | Case normalized |
 | `cass search "auth" --max_results 5` | `cass search "auth" --limit 5` | Snake-case long flag normalized before alias recovery |
-| `cass find "auth"` | `cass search "auth"` | `find`/`query`/`q` → `search` via alias table |
+| `cass find "auth"` | `cass find "auth"` | `find` is the direct source-log command; it no longer rewrites to indexed search |
 | `cass --robot-docs` | `cass robot-docs` | Flag-as-subcommand detected |
 | `cass commands --json` | `cass robot-docs commands` | Robot-docs topic shorthand detected |
 | `cass schemas --json` | `cass robot-docs schemas` | Robot-docs topic shorthand detected |
@@ -811,7 +811,7 @@ The CLI applies multiple normalization layers:
 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
 3. **Snake-case flag recovery**: `--max_results`, `--data_dir`, and other known snake_case long flags become canonical kebab-case before alias recovery runs
 4. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
-5. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `answer`/`evidence`/`bundle`/`handoff`/`why`/`explain`/`rca`/`root-cause`/`summarize` → `pack`; `html-export`/`html_export`/`exporthtml` → `export-html`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
+5. **Subcommand aliases**: `ready`/`preflight` → `triage`; `query`/`q`/`lookup` → `search`; `grep` remains a low-level direct scanner alongside product-facing `find`; `answer`/`evidence`/`bundle`/`handoff`/`why`/`explain`/`rca`/`root-cause`/`summarize` → `pack`; `html-export`/`html_export`/`exporthtml` → `export-html`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
 6. **Robot-docs topic shorthands**: non-command topics such as `commands`, `schemas`, `examples`, `exit-codes`, and `guide` become `robot-docs <topic>` instead of falling through to search; command topics such as `doctor` and `sources` use structured help (`cass help doctor --json`, `cass sources --help --json`)
 7. **Root robot default**: `cass --json`, `cass --robot`, or `cass --robot-format json` with no subcommand runs read-only `triage`
 8. **Leading structured flag recovery**: `--json`/`--robot` before a robot-capable subcommand is moved onto that subcommand

@@ -95,7 +95,42 @@ pub struct LiveGrepSession {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DirectQueryPlan {
+    pub intent: String,
+    pub reason: String,
+    pub engine: String,
+    pub execution_path: String,
+    pub provider_scope: Vec<String>,
+    pub root_scope: Vec<String>,
+    pub time_scope: String,
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+    pub max_hits_per_file: usize,
+    pub limit: usize,
+    pub role: RoleFilter,
+    pub order: ScanOrder,
+    pub regex: bool,
+    pub case_sensitive: bool,
+    pub timeout_ms: u128,
+    pub budget: DirectQueryBudget,
+    pub will_touch: Vec<String>,
+    pub will_not_touch: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectQueryBudget {
+    pub timeout_ms: u128,
+    pub max_files: usize,
+    pub max_bytes_per_file: u64,
+    pub threads: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct LiveGrepMeta {
+    pub intent: String,
+    pub query_plan: DirectQueryPlan,
+    pub touched_subsystems: Vec<String>,
+    pub did_not_touch_subsystems: Vec<String>,
     pub candidate_files: usize,
     pub scanned_files: usize,
     pub skipped_files: usize,
@@ -196,6 +231,8 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
 
     let sessions = summarize_sessions(&hits);
     let matched_files = sessions.len();
+    let touched_subsystems = direct_touched_subsystems();
+    let did_not_touch_subsystems = direct_did_not_touch_subsystems();
 
     Ok(LiveGrepResult {
         query: opts.query.clone(),
@@ -207,6 +244,46 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
         _meta: LiveGrepMeta {
+            intent: "direct_find".to_string(),
+            query_plan: DirectQueryPlan {
+                intent: "direct_find".to_string(),
+                reason: "source_log_first_exact_or_phrase_recovery".to_string(),
+                engine: "live_grep".to_string(),
+                execution_path: "bounded-filesystem-scan".to_string(),
+                provider_scope: if opts.agents.is_empty() {
+                    vec!["all-detected-session-files".to_string()]
+                } else {
+                    opts.agents.clone()
+                },
+                root_scope: opts
+                    .roots
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+                time_scope: opts
+                    .time_filter_label
+                    .clone()
+                    .unwrap_or_else(|| "all".to_string()),
+                max_files: opts.max_files,
+                max_file_bytes: opts.max_file_bytes,
+                max_hits_per_file,
+                limit,
+                role: opts.role,
+                order: opts.order,
+                regex: opts.regex,
+                case_sensitive: !opts.ignore_case,
+                timeout_ms: opts.timeout.as_millis(),
+                budget: DirectQueryBudget {
+                    timeout_ms: opts.timeout.as_millis(),
+                    max_files: opts.max_files,
+                    max_bytes_per_file: opts.max_file_bytes,
+                    threads: 1,
+                },
+                will_touch: touched_subsystems.clone(),
+                will_not_touch: did_not_touch_subsystems.clone(),
+            },
+            touched_subsystems,
+            did_not_touch_subsystems,
             candidate_files,
             scanned_files,
             skipped_files,
@@ -223,6 +300,24 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
             time_filter: opts.time_filter_label.clone(),
         },
     })
+}
+
+fn direct_touched_subsystems() -> Vec<String> {
+    vec!["source_files".to_string()]
+}
+
+fn direct_did_not_touch_subsystems() -> Vec<String> {
+    [
+        "sqlite",
+        "tantivy",
+        "semantic_vectors",
+        "reranker",
+        "daemon",
+        "index_locks",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 fn sort_candidates(candidates: &mut [CandidateFile], order: ScanOrder) {
@@ -699,6 +794,42 @@ mod tests {
         assert_eq!(result._meta.candidate_files, 1);
         assert_eq!(result._meta.scanned_files, 1);
         assert!(!result._meta.timed_out);
+        assert_eq!(result._meta.intent, "direct_find");
+        assert_eq!(
+            result._meta.touched_subsystems,
+            vec!["source_files".to_string()]
+        );
+        assert!(
+            result
+                ._meta
+                .did_not_touch_subsystems
+                .contains(&"sqlite".to_string())
+        );
+        assert!(
+            result
+                ._meta
+                .did_not_touch_subsystems
+                .contains(&"tantivy".to_string())
+        );
+        assert_eq!(result._meta.query_plan.engine, "live_grep");
+        assert_eq!(result._meta.query_plan.intent, "direct_find");
+        assert_eq!(
+            result._meta.query_plan.reason,
+            "source_log_first_exact_or_phrase_recovery"
+        );
+        assert_eq!(
+            result._meta.query_plan.execution_path,
+            "bounded-filesystem-scan"
+        );
+        assert_eq!(result._meta.query_plan.budget.threads, 1);
+        assert_eq!(
+            result._meta.query_plan.will_touch,
+            result._meta.touched_subsystems
+        );
+        assert_eq!(
+            result._meta.query_plan.will_not_touch,
+            result._meta.did_not_touch_subsystems
+        );
     }
 
     #[test]

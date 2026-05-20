@@ -10,7 +10,7 @@ Updated: 2026-05-20
 - Format recovery: `cass search "query" --format json` and `cass --format json status` are accepted as `--robot-format json`
 - Result-count recovery: `cass search "query" --max-results 5`, `--top-k 5`, and `-n 5` are accepted as `--limit 5`
 - First index: `cass index --full --json`
-- Direct live session search: `cass grep "exact phrase" --agent codex --today --role user --json`
+- Direct live session search: `cass find "exact phrase" --agent codex --today --role user --json`
 - Search JSON: `cass search "query" --robot`
 - Handoff pack: `cass pack "query" --robot --max-tokens 12000 --limit 40`
 - Default search: hybrid-preferred. Lexical is required; semantic refinement joins when ready.
@@ -25,7 +25,7 @@ Updated: 2026-05-20
 | Need | Command |
 | --- | --- |
 | One-shot preflight | `cass triage --json` |
-| Find a live/recent agent chat by exact text | `cass grep "remote-preservation score" --agent codex --today --role user --json` |
+| Find a live/recent agent chat by exact text | `cass find "remote-preservation score" --agent codex --today --role user --json` |
 | Search with JSON | `cass search "panic" --robot` |
 | Build cited handoff evidence | `cass pack "panic root cause" --robot --max-tokens 12000 --limit 40` |
 | Search today | `cass search "auth" --robot --today` |
@@ -40,7 +40,7 @@ Updated: 2026-05-20
 | Introspection | `cass introspect --json` (schemas for responses) |
 
 ## Search asset contract
-- `cass grep` is the direct source-log path for exact or phrase-like agent-chat recovery. It bypasses SQLite, Tantivy, semantic vectors, rerankers, daemons, and index locks. Its freshness boundary is the provider's own session file, not the cass index. Use it before `cass search` when the task is "find/resume the chat that said X."
+- `cass find` is the direct source-log path for exact or phrase-like agent-chat recovery. It bypasses SQLite, Tantivy, semantic vectors, rerankers, daemons, and index locks. Its freshness boundary is the provider's own session file, not the cass index. Use it before `cass search` when the task is "find/resume the chat that said X." `cass grep` remains the low-level direct scanner.
 - SQLite is the source of truth for indexed conversations and messages.
 - Lexical search is the required fast path. If the lexical derivative is missing, stale, schema-drifted, or corrupt, cass reports that state and should rebuild it from SQLite instead of requiring routine manual repair.
 - Hybrid is the default search intent. With `--robot-meta`, `_meta.requested_search_mode`, `_meta.search_mode`, `_meta.semantic_refinement`, `_meta.fallback_tier`, and `_meta.fallback_reason` tell agents what actually happened.
@@ -48,11 +48,12 @@ Updated: 2026-05-20
 - Treat `next_command` / `recommended_commands[]` from triage as the exact next-command contract. Health/status expose the same readiness recommendations for narrower probes. `recommended_action` is the human-readable summary; do not run repair commands by habit when cass is already rebuilding or when lexical fallback is an expected state.
 
 ## Response shapes (robot)
-- Grep:
+- Find/Grep:
   - top-level: `query, hits, sessions, roots, _meta`
   - `sessions[]`: `source_path, agent, modified, hit_count, first_line_number, first_snippet`
   - `hits[]`: `source_path, line_number, agent, modified, snippet`
-  - `_meta`: `candidate_files, scanned_files, skipped_files, matched_files, elapsed_ms, timed_out, limit, max_files, max_file_bytes, max_hits_per_file, role, include_compacted, order, time_filter`
+  - `_meta`: `intent, query_plan, touched_subsystems, did_not_touch_subsystems, candidate_files, scanned_files, skipped_files, matched_files, elapsed_ms, timed_out, limit, max_files, max_file_bytes, max_hits_per_file, role, include_compacted, order, time_filter`
+  - `_meta.query_plan`: `intent, reason, engine, execution_path, provider_scope, root_scope, time_scope, budget{timeout_ms,max_files,max_bytes_per_file,threads}, will_touch, will_not_touch`
 - Search:
   - top-level: `query, limit, offset, count, total_matches, hits, cursor, hits_clamped, request_id`
   - `_meta` (with `--robot-meta`): `elapsed_ms, search_mode, requested_search_mode, mode_defaulted, semantic_refinement, fallback_tier, fallback_reason, wildcard_fallback, cache_stats{hits,misses,shortfall}, tokens_estimated, max_tokens, next_cursor, hits_clamped, state{index, database}, index_freshness`
@@ -70,7 +71,7 @@ Updated: 2026-05-20
 - Capabilities: `crate_version, api_version, contract_version, features[], connectors[], workflows[], mistake_recoveries[], limits{max_limit,max_content_length,max_fields,max_agg_buckets}`
 
 ## Flags worth knowing
-- Direct grep: `--role user|assistant|tool|any`, `--order newest|oldest`, `--per-file-limit N`, `--include-compacted`, `--max-files N`, `--timeout MS`
+- Direct find/grep: `--role user|assistant|tool|any`, `--order newest|oldest`, `--per-file-limit N`, `--include-compacted`, `--max-files N`, `--timeout MS`
 - `--fields minimal|summary|<list>`: reduce payload size
 - `--max-content-length N` / `--max-tokens N`: truncate per-field / by budget
 - `--robot-format json|jsonl|compact`: choose encoding
@@ -84,7 +85,7 @@ Updated: 2026-05-20
 - Pack input narrowing: `--sessions-from FILE|-`, `--source NAME`, `--agent NAME`, `--workspace DIR`, time filters
 
 ## Best practices for agents
-- For exact phrase recovery, current-session recovery, stale-index recovery, and "find the chat I was just doing" tasks, start with `cass grep`. Use `cass search` after that when you need indexed ranking, aggregations, broad fuzzy recall, or answer-pack workflows.
+- For exact phrase recovery, current-session recovery, stale-index recovery, and "find the chat I was just doing" tasks, start with `cass find`. Use `cass search` after that when you need indexed ranking, aggregations, broad fuzzy recall, or answer-pack workflows.
 - Always pass `--robot`/`--json` and `--robot-meta` when you care about freshness or pagination.
 - Start unknown automation with `cass triage --json`; aliases `cass ready --json` and `cass preflight --json` are accepted. If an agent only knows to request structured output, `cass --json`, `cass --robot`, `cass --robot-format json`, and `cass --format json` default to the same read-only triage response. If the agent puts `--json`, `--robot`, or `--format json` before a robot-capable subcommand, cass moves it to that subcommand. If the agent spells required inputs as named options, cass converts `--query` and `--path` forms to the required positional syntax for the robot-facing workflow commands. If it uses a familiar count alias such as `--max-results`, `--count`, `--top-k`, or `-n`, cass converts that to `--limit` on commands with result limits.
 - Use `--fields minimal` during wide scans; fetch details with `cass view` if needed.
