@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use clap::ValueEnum;
 use regex::RegexBuilder;
 use serde::Serialize;
-use std::collections::BTreeSet;
-use std::fs::File;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -33,6 +33,7 @@ pub struct LiveGrepOptions {
     pub until: Option<SystemTime>,
     pub time_filter_label: Option<String>,
     pub role: RoleFilter,
+    pub order: ScanOrder,
     pub ignore_case: bool,
     pub regex: bool,
 }
@@ -53,6 +54,7 @@ impl LiveGrepOptions {
             until: None,
             time_filter_label: Some("last 14 days".to_string()),
             role: RoleFilter::Any,
+            order: ScanOrder::Newest,
             ignore_case: true,
             regex: false,
         }
@@ -67,6 +69,12 @@ pub enum RoleFilter {
     Tool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, ValueEnum)]
+pub enum ScanOrder {
+    Newest,
+    Oldest,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveGrepHit {
     pub source_path: String,
@@ -77,7 +85,18 @@ pub struct LiveGrepHit {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct LiveGrepSession {
+    pub source_path: String,
+    pub agent: String,
+    pub modified: Option<String>,
+    pub hit_count: usize,
+    pub first_line_number: usize,
+    pub first_snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct LiveGrepMeta {
+    pub candidate_files: usize,
     pub scanned_files: usize,
     pub skipped_files: usize,
     pub matched_files: usize,
@@ -89,6 +108,7 @@ pub struct LiveGrepMeta {
     pub max_hits_per_file: usize,
     pub role: RoleFilter,
     pub include_compacted: bool,
+    pub order: ScanOrder,
     pub time_filter: Option<String>,
 }
 
@@ -96,6 +116,7 @@ pub struct LiveGrepMeta {
 pub struct LiveGrepResult {
     pub query: String,
     pub hits: Vec<LiveGrepHit>,
+    pub sessions: Vec<LiveGrepSession>,
     pub roots: Vec<String>,
     pub _meta: LiveGrepMeta,
 }
@@ -108,12 +129,7 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
     let started = Instant::now();
     let deadline = started + opts.timeout;
     let mut candidates = collect_candidate_files(opts, deadline)?;
-    candidates.sort_by(|left, right| {
-        right
-            .modified
-            .cmp(&left.modified)
-            .then_with(|| left.path.cmp(&right.path))
-    });
+    sort_candidates(&mut candidates, opts.order);
 
     let matcher = Matcher::new(&opts.query, opts.ignore_case, opts.regex)?;
     let limit = if opts.limit == 0 {
@@ -124,9 +140,9 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
     let max_hits_per_file = opts.max_hits_per_file;
     let mut scanned_files = 0usize;
     let mut skipped_files = 0usize;
-    let mut matched_paths = BTreeSet::new();
     let mut hits = Vec::new();
     let mut timed_out = false;
+    let candidate_files = candidates.len();
 
     for candidate in candidates.into_iter().take(opts.max_files) {
         if Instant::now() >= deadline {
@@ -161,7 +177,6 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
             if !line_matches_role(&line, opts.role) || !matcher.matches(&line) {
                 continue;
             }
-            matched_paths.insert(candidate.path.clone());
             hits.push(LiveGrepHit {
                 source_path: candidate.path.to_string_lossy().into_owned(),
                 line_number: index.saturating_add(1),
@@ -179,8 +194,12 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
         }
     }
 
+    let sessions = summarize_sessions(&hits);
+    let matched_files = sessions.len();
+
     Ok(LiveGrepResult {
         query: opts.query.clone(),
+        sessions,
         hits,
         roots: opts
             .roots
@@ -188,9 +207,10 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
         _meta: LiveGrepMeta {
+            candidate_files,
             scanned_files,
             skipped_files,
-            matched_files: matched_paths.len(),
+            matched_files,
             elapsed_ms: started.elapsed().as_millis(),
             timed_out,
             limit,
@@ -199,9 +219,48 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
             max_hits_per_file,
             role: opts.role,
             include_compacted: opts.include_compacted,
+            order: opts.order,
             time_filter: opts.time_filter_label.clone(),
         },
     })
+}
+
+fn sort_candidates(candidates: &mut [CandidateFile], order: ScanOrder) {
+    match order {
+        ScanOrder::Newest => candidates.sort_by(|left, right| {
+            right
+                .modified
+                .cmp(&left.modified)
+                .then_with(|| left.path.cmp(&right.path))
+        }),
+        ScanOrder::Oldest => candidates.sort_by(|left, right| {
+            left.modified
+                .cmp(&right.modified)
+                .then_with(|| left.path.cmp(&right.path))
+        }),
+    }
+}
+
+fn summarize_sessions(hits: &[LiveGrepHit]) -> Vec<LiveGrepSession> {
+    let mut session_indexes = BTreeMap::<String, usize>::new();
+    let mut sessions = Vec::<LiveGrepSession>::new();
+    for hit in hits {
+        if let Some(index) = session_indexes.get(&hit.source_path).copied() {
+            sessions[index].hit_count = sessions[index].hit_count.saturating_add(1);
+        } else {
+            let index = sessions.len();
+            session_indexes.insert(hit.source_path.clone(), index);
+            sessions.push(LiveGrepSession {
+                source_path: hit.source_path.clone(),
+                agent: hit.agent.clone(),
+                modified: hit.modified.clone(),
+                hit_count: 1,
+                first_line_number: hit.line_number,
+                first_snippet: hit.snippet.clone(),
+            });
+        }
+    }
+    sessions
 }
 
 fn is_compacted_history_line(line: &str) -> bool {
@@ -256,13 +315,19 @@ fn collect_candidate_files(
         if !root.exists() {
             continue;
         }
+        if let Some(mut known_candidates) =
+            collect_known_dated_candidates(root, opts, &wanted_agents, deadline)
+        {
+            files.append(&mut known_candidates);
+            continue;
+        }
         for entry in WalkDir::new(root)
             .follow_links(false)
             .into_iter()
             .filter_entry(|entry| !is_hidden_noise_dir(entry))
             .filter_map(|entry| entry.ok())
         {
-            if Instant::now() >= deadline || files.len() >= opts.max_files {
+            if Instant::now() >= deadline {
                 break;
             }
             if !entry.file_type().is_file() || !is_session_file(entry.path()) {
@@ -290,6 +355,150 @@ fn collect_candidate_files(
     }
 
     Ok(files)
+}
+
+fn collect_known_dated_candidates(
+    root: &Path,
+    opts: &LiveGrepOptions,
+    wanted_agents: &BTreeSet<String>,
+    deadline: Instant,
+) -> Option<Vec<CandidateFile>> {
+    let since = opts.since?;
+    let home = dirs::home_dir()?;
+    let codex_tabs_root = home.join(".codex/tabs");
+    let codex_sessions_root = home.join(".codex/sessions");
+    let dates = date_range_for_filter(since, opts.until)?;
+
+    if root == codex_sessions_root {
+        return Some(collect_dated_session_dir_candidates(
+            root,
+            &dates,
+            "codex",
+            wanted_agents,
+            opts,
+            deadline,
+        ));
+    }
+
+    if root == codex_tabs_root {
+        let mut files = Vec::new();
+        let tab_dirs = match fs::read_dir(root) {
+            Ok(tab_dirs) => tab_dirs,
+            Err(_) => return Some(files),
+        };
+        for tab_dir in tab_dirs.filter_map(|entry| entry.ok()) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let tab_path = tab_dir.path();
+            if !tab_path.is_dir() {
+                continue;
+            }
+            push_candidate_if_session_file(
+                &mut files,
+                tab_path.join("history.jsonl"),
+                "codex",
+                wanted_agents,
+                opts,
+            );
+            let sessions_root = tab_path.join("sessions");
+            files.extend(collect_dated_session_dir_candidates(
+                &sessions_root,
+                &dates,
+                "codex",
+                wanted_agents,
+                opts,
+                deadline,
+            ));
+        }
+        return Some(files);
+    }
+
+    None
+}
+
+fn collect_dated_session_dir_candidates(
+    sessions_root: &Path,
+    dates: &[NaiveDate],
+    agent: &str,
+    wanted_agents: &BTreeSet<String>,
+    opts: &LiveGrepOptions,
+    deadline: Instant,
+) -> Vec<CandidateFile> {
+    let mut files = Vec::new();
+    for date in dates {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let dir = sessions_root
+            .join(format!("{:04}", date.year()))
+            .join(format!("{:02}", date.month()))
+            .join(format!("{:02}", date.day()));
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            push_candidate_if_session_file(&mut files, entry.path(), agent, wanted_agents, opts);
+        }
+    }
+    files
+}
+
+fn date_range_for_filter(since: SystemTime, until: Option<SystemTime>) -> Option<Vec<NaiveDate>> {
+    let start = DateTime::<Local>::from(since).date_naive();
+    let exclusive_end = until.unwrap_or_else(SystemTime::now);
+    let end_adjusted = exclusive_end
+        .checked_sub(Duration::from_millis(1))
+        .unwrap_or(exclusive_end);
+    let end = DateTime::<Local>::from(end_adjusted).date_naive();
+    if end < start {
+        return Some(Vec::new());
+    }
+    let day_count = end.signed_duration_since(start).num_days();
+    if day_count > 120 {
+        return None;
+    }
+    Some(
+        (0..=day_count)
+            .filter_map(|offset| start.checked_add_days(chrono::Days::new(offset as u64)))
+            .collect(),
+    )
+}
+
+fn push_candidate_if_session_file(
+    files: &mut Vec<CandidateFile>,
+    path: PathBuf,
+    agent: &str,
+    wanted_agents: &BTreeSet<String>,
+    opts: &LiveGrepOptions,
+) {
+    if !wanted_agents.is_empty() && !wanted_agents.contains(agent) {
+        return;
+    }
+    if !is_session_file(&path) {
+        return;
+    }
+    let metadata = match path.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return,
+    };
+    if !metadata.is_file() {
+        return;
+    }
+    let modified = metadata.modified().ok();
+    if !time_in_range(modified, opts.since, opts.until) {
+        return;
+    }
+    files.push(CandidateFile {
+        path,
+        agent: agent.to_string(),
+        modified,
+        size_bytes: metadata.len(),
+    });
 }
 
 fn is_hidden_noise_dir(entry: &DirEntry) -> bool {
@@ -476,6 +685,7 @@ mod tests {
             until: None,
             time_filter_label: None,
             role: RoleFilter::Any,
+            order: ScanOrder::Newest,
             ignore_case: true,
             regex: false,
         };
@@ -483,9 +693,105 @@ mod tests {
         let result = live_grep(&opts).expect("live grep");
 
         assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].hit_count, 1);
         assert_eq!(result.hits[0].line_number, 1);
+        assert_eq!(result._meta.candidate_files, 1);
         assert_eq!(result._meta.scanned_files, 1);
         assert!(!result._meta.timed_out);
+    }
+
+    #[test]
+    fn live_grep_caps_hits_per_session_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session = tmp.path().join("rollout-many.jsonl");
+        let mut file = File::create(&session).expect("create session");
+        writeln!(file, "{{\"message\":\"needle one\"}}").expect("write one");
+        writeln!(file, "{{\"message\":\"needle two\"}}").expect("write two");
+        writeln!(file, "{{\"message\":\"needle three\"}}").expect("write three");
+
+        let opts = LiveGrepOptions {
+            query: "needle".to_string(),
+            roots: vec![tmp.path().to_path_buf()],
+            agents: Vec::new(),
+            limit: 10,
+            max_files: 20,
+            max_file_bytes: 1024 * 1024,
+            max_hits_per_file: 2,
+            timeout: Duration::from_secs(1),
+            include_compacted: false,
+            since: None,
+            until: None,
+            time_filter_label: None,
+            role: RoleFilter::Any,
+            order: ScanOrder::Newest,
+            ignore_case: true,
+            regex: false,
+        };
+
+        let result = live_grep(&opts).expect("live grep");
+
+        assert_eq!(result.hits.len(), 2);
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].hit_count, 2);
+    }
+
+    #[test]
+    fn session_summaries_preserve_first_hit_order() {
+        let hits = vec![
+            LiveGrepHit {
+                source_path: "/tmp/b.jsonl".to_string(),
+                line_number: 7,
+                agent: "codex".to_string(),
+                modified: None,
+                snippet: "first b".to_string(),
+            },
+            LiveGrepHit {
+                source_path: "/tmp/a.jsonl".to_string(),
+                line_number: 3,
+                agent: "codex".to_string(),
+                modified: None,
+                snippet: "first a".to_string(),
+            },
+            LiveGrepHit {
+                source_path: "/tmp/b.jsonl".to_string(),
+                line_number: 9,
+                agent: "codex".to_string(),
+                modified: None,
+                snippet: "second b".to_string(),
+            },
+        ];
+
+        let sessions = summarize_sessions(&hits);
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].source_path, "/tmp/b.jsonl");
+        assert_eq!(sessions[0].hit_count, 2);
+        assert_eq!(sessions[1].source_path, "/tmp/a.jsonl");
+    }
+
+    #[test]
+    fn candidate_sort_supports_oldest_first_retry() {
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        let mut candidates = vec![
+            CandidateFile {
+                path: PathBuf::from("/tmp/newer.jsonl"),
+                agent: "codex".to_string(),
+                modified: Some(newer),
+                size_bytes: 1,
+            },
+            CandidateFile {
+                path: PathBuf::from("/tmp/older.jsonl"),
+                agent: "codex".to_string(),
+                modified: Some(older),
+                size_bytes: 1,
+            },
+        ];
+
+        sort_candidates(&mut candidates, ScanOrder::Oldest);
+
+        assert_eq!(candidates[0].path, PathBuf::from("/tmp/older.jsonl"));
     }
 
     #[test]

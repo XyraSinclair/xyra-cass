@@ -385,6 +385,9 @@ pub enum Commands {
         /// Filter matching lines by rough message role.
         #[arg(long, value_enum, default_value_t = live_grep::RoleFilter::Any)]
         role: live_grep::RoleFilter,
+        /// Scan newest or oldest candidate sessions first.
+        #[arg(long, value_enum, default_value_t = live_grep::ScanOrder::Newest)]
+        order: live_grep::ScanOrder,
         /// Include Codex compacted-history blobs. Off by default to avoid noisy duplicate hits.
         #[arg(long, default_value_t = false)]
         include_compacted: bool,
@@ -3044,6 +3047,11 @@ fn assignment_option_for_command(command: &str, key: &str) -> Option<AssignmentO
                 aliases: &["--role"],
                 repeatable: false,
             }),
+            "order" => Some(AssignmentOption {
+                flag: "--order",
+                aliases: &["--order"],
+                repeatable: false,
+            }),
             "days" => Some(AssignmentOption {
                 flag: "--days",
                 aliases: &["--days"],
@@ -3628,6 +3636,7 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
             | "per-file-limit"
             | "per_file_limit"
             | "role"
+            | "order"
             | "data-dir"
             | "data_dir"
             | "days"
@@ -4273,6 +4282,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "per_file_limit",
         "include-compacted",
         "include_compacted",
+        "order",
         "max-results",
         "num-results",
         "results",
@@ -4319,6 +4329,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "case-sensitive",
         "case_sensitive",
         "role",
+        "order",
         "full",
         "watch",
         "data-dir",
@@ -6022,6 +6033,7 @@ async fn execute_cli(
                     max_file_bytes,
                     per_file_limit,
                     role,
+                    order,
                     include_compacted,
                     timeout,
                     all,
@@ -6044,6 +6056,7 @@ async fn execute_cli(
                         max_file_bytes,
                         per_file_limit,
                         role,
+                        order,
                         include_compacted,
                         timeout,
                         all,
@@ -15364,6 +15377,7 @@ fn run_live_grep_command(
     max_file_bytes: u64,
     per_file_limit: usize,
     role: live_grep::RoleFilter,
+    order: live_grep::ScanOrder,
     include_compacted: bool,
     timeout_ms: u64,
     all: bool,
@@ -15389,6 +15403,7 @@ fn run_live_grep_command(
     opts.max_file_bytes = max_file_bytes;
     opts.max_hits_per_file = per_file_limit;
     opts.role = role;
+    opts.order = order;
     opts.include_compacted = include_compacted;
     opts.timeout = Duration::from_millis(timeout_ms.max(1));
     opts.regex = regex;
