@@ -53,24 +53,29 @@ Homebrew bottles are currently published for Linux and Apple Silicon macOS. On I
 cass triage --json
 #    From zero context, `cass --json` and `cass --robot` also resolve to triage.
 
-# 2) Search across all agent history. Default search is hybrid-preferred:
+# 2) Find or resume a live/recent agent chat without touching the index.
+#    Use this first for exact phrases, current-session recovery, stale-index
+#    recovery, and "what was that prompt?" archaeology.
+cass grep "remote-preservation score" --agent codex --today --role user --json
+
+# 3) Search across the indexed archive. Default search is hybrid-preferred:
 #    lexical is the fast required path; semantic refinement joins when ready.
 cass search "authentication error" --robot --limit 5 --fields minimal
 
-# 3) Find the current or recent session for this workspace
+# 4) Find the current or recent session for this workspace
 cass sessions --current --json
 cass sessions --workspace "$(pwd)" --json --limit 5
 
-# 4) View + expand a hit (use source_path/line_number from search output)
+# 5) View + expand a hit (use source_path/line_number from search output)
 cass view /path/to/session.jsonl -n 42 --json
 cass expand /path/to/session.jsonl -n 42 -C 3 --json
 
-# 5) Discover the full machine API
+# 6) Discover the full machine API
 cass capabilities --json
 cass robot-docs guide
 cass robot-docs schemas
 
-# 6) Exclude a noisy agent harness from future indexing
+# 7) Exclude a noisy agent harness from future indexing
 cass sources agents list --json
 cass sources agents exclude openclaw
 cass sources agents include openclaw
@@ -82,6 +87,7 @@ cass sources agents include openclaw
 - exit 0 = success
 
 **Search asset contract**
+- `cass grep` is the direct source-log path for exact or phrase-like agent-chat recovery. It bypasses SQLite, Tantivy, semantic vectors, rerankers, daemons, and index locks. Its freshness boundary is the provider's own session file, not the cass index.
 - SQLite is the source of truth for indexed conversations and messages. All derived assets (lexical index, semantic vectors, analytics rollups, retention backups) can be rebuilt from SQLite; no derived asset is authoritative.
 - Lexical search is the required fast path. Missing, stale, or incompatible lexical assets are treated as derived-state problems that cass should rebuild from SQLite instead of asking operators to perform routine manual repair.
 - Hybrid is the default search intent. Robot metadata (`--robot --robot-meta`) reports the requested mode, realized mode, semantic refinement status, and any lexical fallback reason when semantic assets are not ready.

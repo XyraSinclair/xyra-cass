@@ -3,8 +3,8 @@
 //! Bead `3pjoy` (u9osp follow-up): the LLM-facing `robot-docs` surface
 //! emits bounded plain text per topic. Some topics (`exit-codes`, `env`,
 //! `schemas`) are host-independent. Others (`paths`) embed the resolved
-//! data-dir, so we pin `XDG_DATA_HOME` / `HOME` and then scrub the test
-//! home prefix to `[TEST_HOME]` before comparison.
+//! data-dir, so we pin `CASS_DATA_DIR`, `XDG_DATA_HOME`, and `HOME`, then
+//! scrub the test home prefix to `[TEST_HOME]` before comparison.
 //!
 //! ## Regenerate
 //!
@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 fn cass_cmd(test_home: &Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_DATA_DIR", test_home.join("coding-agent-search"))
         .env("XDG_DATA_HOME", test_home)
         .env("HOME", test_home)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
