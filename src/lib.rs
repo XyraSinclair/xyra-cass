@@ -379,6 +379,15 @@ pub enum Commands {
         /// Skip individual files larger than this many bytes.
         #[arg(long, default_value_t = 4 * 1024 * 1024)]
         max_file_bytes: u64,
+        /// Max hits from one session file. 0 disables the per-file cap.
+        #[arg(long, default_value_t = 3)]
+        per_file_limit: usize,
+        /// Filter matching lines by rough message role.
+        #[arg(long, value_enum, default_value_t = live_grep::RoleFilter::Any)]
+        role: live_grep::RoleFilter,
+        /// Include Codex compacted-history blobs. Off by default to avoid noisy duplicate hits.
+        #[arg(long, default_value_t = false)]
+        include_compacted: bool,
         /// Stop scanning after this many milliseconds.
         #[arg(long, default_value_t = 3_000)]
         timeout: u64,
@@ -3020,9 +3029,19 @@ fn assignment_option_for_command(command: &str, key: &str) -> Option<AssignmentO
                 aliases: &["--max-file-bytes"],
                 repeatable: false,
             }),
+            "per-file-limit" | "per_file_limit" => Some(AssignmentOption {
+                flag: "--per-file-limit",
+                aliases: &["--per-file-limit"],
+                repeatable: false,
+            }),
             "timeout" => Some(AssignmentOption {
                 flag: "--timeout",
                 aliases: &["--timeout"],
+                repeatable: false,
+            }),
+            "role" => Some(AssignmentOption {
+                flag: "--role",
+                aliases: &["--role"],
                 repeatable: false,
             }),
             "days" => Some(AssignmentOption {
@@ -3601,6 +3620,14 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
             | "request_id"
             | "cursor"
             | "display"
+            | "root"
+            | "max-files"
+            | "max_files"
+            | "max-file-bytes"
+            | "max_file_bytes"
+            | "per-file-limit"
+            | "per_file_limit"
+            | "role"
             | "data-dir"
             | "data_dir"
             | "days"
@@ -4242,6 +4269,10 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "max-files",
         "max_file_bytes",
         "max-file-bytes",
+        "per-file-limit",
+        "per_file_limit",
+        "include-compacted",
+        "include_compacted",
         "max-results",
         "num-results",
         "results",
@@ -4287,6 +4318,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "regex",
         "case-sensitive",
         "case_sensitive",
+        "role",
         "full",
         "watch",
         "data-dir",
@@ -5988,6 +6020,9 @@ async fn execute_cli(
                     limit,
                     max_files,
                     max_file_bytes,
+                    per_file_limit,
+                    role,
+                    include_compacted,
                     timeout,
                     all,
                     days,
@@ -6007,6 +6042,9 @@ async fn execute_cli(
                         limit,
                         max_files,
                         max_file_bytes,
+                        per_file_limit,
+                        role,
+                        include_compacted,
                         timeout,
                         all,
                         days,
@@ -15324,6 +15362,9 @@ fn run_live_grep_command(
     limit: usize,
     max_files: usize,
     max_file_bytes: u64,
+    per_file_limit: usize,
+    role: live_grep::RoleFilter,
+    include_compacted: bool,
     timeout_ms: u64,
     all: bool,
     days: Option<u32>,
@@ -15346,6 +15387,9 @@ fn run_live_grep_command(
     opts.limit = limit;
     opts.max_files = max_files;
     opts.max_file_bytes = max_file_bytes;
+    opts.max_hits_per_file = per_file_limit;
+    opts.role = role;
+    opts.include_compacted = include_compacted;
     opts.timeout = Duration::from_millis(timeout_ms.max(1));
     opts.regex = regex;
     opts.ignore_case = !case_sensitive;

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use clap::ValueEnum;
 use regex::RegexBuilder;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -12,6 +13,7 @@ use walkdir::{DirEntry, WalkDir};
 const DEFAULT_LIMIT: usize = 20;
 const DEFAULT_MAX_FILES: usize = 2_000;
 const DEFAULT_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const DEFAULT_MAX_HITS_PER_FILE: usize = 3;
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(3_000);
 const DEFAULT_RECENT_WINDOW: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAX_SNIPPET_CHARS: usize = 500;
@@ -24,10 +26,13 @@ pub struct LiveGrepOptions {
     pub limit: usize,
     pub max_files: usize,
     pub max_file_bytes: u64,
+    pub max_hits_per_file: usize,
     pub timeout: Duration,
+    pub include_compacted: bool,
     pub since: Option<SystemTime>,
     pub until: Option<SystemTime>,
     pub time_filter_label: Option<String>,
+    pub role: RoleFilter,
     pub ignore_case: bool,
     pub regex: bool,
 }
@@ -41,14 +46,25 @@ impl LiveGrepOptions {
             limit: DEFAULT_LIMIT,
             max_files: DEFAULT_MAX_FILES,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_hits_per_file: DEFAULT_MAX_HITS_PER_FILE,
             timeout: DEFAULT_TIMEOUT,
+            include_compacted: false,
             since: SystemTime::now().checked_sub(DEFAULT_RECENT_WINDOW),
             until: None,
             time_filter_label: Some("last 14 days".to_string()),
+            role: RoleFilter::Any,
             ignore_case: true,
             regex: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, ValueEnum)]
+pub enum RoleFilter {
+    Any,
+    User,
+    Assistant,
+    Tool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +86,9 @@ pub struct LiveGrepMeta {
     pub limit: usize,
     pub max_files: usize,
     pub max_file_bytes: u64,
+    pub max_hits_per_file: usize,
+    pub role: RoleFilter,
+    pub include_compacted: bool,
     pub time_filter: Option<String>,
 }
 
@@ -102,6 +121,7 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
     } else {
         opts.limit
     };
+    let max_hits_per_file = opts.max_hits_per_file;
     let mut scanned_files = 0usize;
     let mut skipped_files = 0usize;
     let mut matched_paths = BTreeSet::new();
@@ -126,6 +146,7 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
             }
         };
         let reader = BufReader::new(file);
+        let mut file_hits = 0usize;
         for (index, line) in reader.lines().enumerate() {
             if Instant::now() >= deadline {
                 timed_out = true;
@@ -134,7 +155,10 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
             let Ok(line) = line else {
                 continue;
             };
-            if !matcher.matches(&line) {
+            if !opts.include_compacted && is_compacted_history_line(&line) {
+                continue;
+            }
+            if !line_matches_role(&line, opts.role) || !matcher.matches(&line) {
                 continue;
             }
             matched_paths.insert(candidate.path.clone());
@@ -145,7 +169,8 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
                 modified: candidate.modified.map(format_system_time),
                 snippet: trim_snippet(&line),
             });
-            if hits.len() >= limit {
+            file_hits = file_hits.saturating_add(1);
+            if hits.len() >= limit || (max_hits_per_file > 0 && file_hits >= max_hits_per_file) {
                 break;
             }
         }
@@ -171,9 +196,38 @@ pub fn live_grep(opts: &LiveGrepOptions) -> Result<LiveGrepResult> {
             limit,
             max_files: opts.max_files,
             max_file_bytes: opts.max_file_bytes,
+            max_hits_per_file,
+            role: opts.role,
+            include_compacted: opts.include_compacted,
             time_filter: opts.time_filter_label.clone(),
         },
     })
+}
+
+fn is_compacted_history_line(line: &str) -> bool {
+    line.contains("\"type\":\"compacted\"")
+}
+
+fn line_matches_role(line: &str, role: RoleFilter) -> bool {
+    match role {
+        RoleFilter::Any => true,
+        RoleFilter::User => {
+            line.contains("\"role\":\"user\"") || line.contains("\"type\":\"user_message\"")
+        }
+        RoleFilter::Assistant => {
+            line.contains("\"role\":\"assistant\"")
+                || line.contains("\"type\":\"assistant\"")
+                || line.contains("\"type\":\"agent_message\"")
+        }
+        RoleFilter::Tool => {
+            line.contains("\"type\":\"function_call\"")
+                || line.contains("\"type\":\"function_call_output\"")
+                || line.contains("\"type\":\"tool_use\"")
+                || line.contains("\"type\":\"tool_result\"")
+                || line.contains("\"name\":\"exec_command\"")
+                || line.contains("\"name\":\"apply_patch\"")
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -415,10 +469,13 @@ mod tests {
             limit: 5,
             max_files: 20,
             max_file_bytes: 1024 * 1024,
+            max_hits_per_file: DEFAULT_MAX_HITS_PER_FILE,
             timeout: Duration::from_secs(1),
+            include_compacted: false,
             since: None,
             until: None,
             time_filter_label: None,
+            role: RoleFilter::Any,
             ignore_case: true,
             regex: false,
         };
@@ -429,5 +486,31 @@ mod tests {
         assert_eq!(result.hits[0].line_number, 1);
         assert_eq!(result._meta.scanned_files, 1);
         assert!(!result._meta.timed_out);
+    }
+
+    #[test]
+    fn role_filter_reduces_tool_output_noise() {
+        assert!(line_matches_role(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"cass search"}]}}"#,
+            RoleFilter::User,
+        ));
+        assert!(!line_matches_role(
+            r#"{"type":"response_item","payload":{"type":"function_call_output","output":"cass search"}}"#,
+            RoleFilter::User,
+        ));
+        assert!(line_matches_role(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"cass search"}}"#,
+            RoleFilter::Tool,
+        ));
+    }
+
+    #[test]
+    fn compacted_history_lines_are_detected() {
+        assert!(is_compacted_history_line(
+            r#"{"timestamp":"2026-05-19T11:44:31Z","type":"compacted","payload":{"replacement_history":[]}}"#
+        ));
+        assert!(!is_compacted_history_line(
+            r#"{"timestamp":"2026-05-19T11:44:31Z","type":"response_item","payload":{}}"#
+        ));
     }
 }
